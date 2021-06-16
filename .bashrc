@@ -98,18 +98,31 @@ if [ -x /usr/bin/dircolors ]; then
     alias egrep='egrep --color=auto'
 fi
 
+############################################
+# TMUX history saving
+############################################
+
+# avoid duplicates
+export HISTCONTROL=ignoredups:erasedups
+
+# append history entries
+shopt -s histappend
+
+# After each command, save and reload history
+export PROMPT_COMMAND="history -a; history -c; history -r; $PROMPT_COMMAND"
+
+############################################
+
 # colored GCC warnings and errors
 #export GCC_COLORS='error=01;31:warning=01;35:note=01;36:caret=01;32:locus=01:quote=01'
 
-# some more ls aliases
+# ls aliases
 alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -l'
-alias dev='./dev'
-alias tp='tmux'
 
-#Jesenovic project alias
-alias dev="./dev"
+# alias to open files in terminal with xdg-open
+alias open='xdg-open'
 
 # Add an "alert" alias for long running commands.  Use like so:
 #   sleep 10; alert
@@ -135,21 +148,11 @@ if ! shopt -oq posix; then
   fi
 fi
 
-#Docker configuration
+# Docker configuration
 export OS_XDEBUG_HOST=$(ip route get 1 | awk '{print $3;exit}')
 export OS_APP_PORT=80
 export OS_DOCKER_MOUNT=./:/var/www
 
+# Vim configuration
 export VISUAL=vim
 export EDITOR="$VISUAL"
-
-#Jesenovic word-rocks docker conf
-export WORD_ROCKS_APP_PORT=8080
-export WORD_ROCKS_APP_DOMAIN=wordrocks.localhost
-export WORD_ROCKS_DB_PORT=3360
-export WORD_ROCKS_DB_ROOT_PASS=secret
-export WORD_ROCKS_DB_NAME=wordrocks
-export WORD_ROCKS_DB_USER=symfony
-export WORD_ROCKS_DB_PASS=secret
-export WORD_ROCKS_DOCKER_MOUNT=wordrocks-sync:/var/www/html/:nocopy
-export SYNC_STRATEGY=native_osx

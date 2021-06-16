@@ -5,6 +5,10 @@ set t_Co=256
 set showmode
 set number
 
+" set bracket highlight
+:highlight MatchParen cterm=underline ctermbg=black ctermfg=red
+:highlight MatchParen gui=underline guibg=black guifg=red
+
 "====================================================================
 " KEYMAPS
 "====================================================================
