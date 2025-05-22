@@ -148,11 +148,6 @@ if ! shopt -oq posix; then
   fi
 fi
 
-# Docker configuration
-export OS_XDEBUG_HOST=$(ip route get 1 | awk '{print $3;exit}')
-export OS_APP_PORT=80
-export OS_DOCKER_MOUNT=./:/var/www
-
 # Vim configuration
 export VISUAL=vim
 export EDITOR="$VISUAL"
