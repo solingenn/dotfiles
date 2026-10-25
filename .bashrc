@@ -1,4 +1,3 @@
-
 # ~/.bashrc: executed by bash(1) for non-login shells.
 # see /usr/share/doc/bash/examples/startup-files (in the package bash-doc)
 # for examples
@@ -148,6 +147,46 @@ if ! shopt -oq posix; then
   fi
 fi
 
+############################################
+# Claude Code auto-compact threshold
+# Raise trigger to 70% of a 1M-token window
+# (compact fires around 700K instead of the
+# default ~95% of the smaller default window).
+############################################
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
+
 # Vim configuration
 export VISUAL=vim
 export EDITOR="$VISUAL"
+export PATH="$HOME/.local/bin:$PATH"
+
+. "$HOME/.local/bin/env"
+
+# Ring the bell when a command ran 30s or longer (BELL_AFTER overrides); tmux shows it as a red ! on the window
+PS0='${PS1:0:$((_bell_cmd_start=SECONDS, 0))}'
+_bell_after_long_cmd() {
+    local rc=$?
+    if [[ -n $_bell_cmd_start ]] && (( SECONDS - _bell_cmd_start >= ${BELL_AFTER:-30} )); then
+        printf '\a'
+    fi
+    unset _bell_cmd_start
+    return $rc
+}
+[[ $PROMPT_COMMAND == *_bell_after_long_cmd* ]] || PROMPT_COMMAND="_bell_after_long_cmd; $PROMPT_COMMAND"
+
+# Starship prompt (config: ~/.config/starship.toml); keep this last so it wraps PROMPT_COMMAND/PS0 above.
+# Without starship the PS1 set earlier in this file is used.
+# A starship_precmd inherited via the exported PROMPT_COMMAND (nested bash) or left by
+# re-sourcing this file is swapped for a no-op, so init wraps the hooks above again.
+if command -v starship >/dev/null; then
+    # keep the xterm title user@host: dir that the PS1 above set
+    case "$TERM" in
+    xterm*|rxvt*)
+        _set_win_title() { printf '\e]0;%s%s@%s: %s\a' "${debian_chroot:+($debian_chroot)}" "$USER" "${HOSTNAME%%.*}" "${PWD/#$HOME/\~}"; }
+        starship_precmd_user_func=_set_win_title
+        ;;
+    esac
+    PROMPT_COMMAND=${PROMPT_COMMAND//starship_precmd/:}
+    eval "$(starship init bash)"
+fi

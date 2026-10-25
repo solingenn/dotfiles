@@ -1,66 +1,75 @@
-# Set up the prompt
-zstyle ':completion:*' completer _complete _ignored _approximate
-zstyle ':completion:*' matcher-list ''
-zstyle ':completion:*' max-errors 5 numeric
-zstyle ':completion:*' menu select=2
-eval "$(dircolors -b)"
-zstyle ':completion:*:default' list-colors ${(s.:.)LS_COLORS}
-zstyle ':completion:*' original false
-zstyle ':completion:*' select-prompt %SScrolling active: current selection at %p%s
-zstyle ':completion:*' list-prompt %SAt %p: Hit TAB for more, or the character to insert%s
-zstyle ':completion:*' verbose true
+# ~/.zshrc: executed by zsh for interactive shells. Mirrors ~/.bashrc; prompt is starship.
 
-# Use modern completion system
-autoload -Uz compinit
-compinit
-
-# Keep 2000 lines of history within the shell and save it to ~/.zsh_history:
-HISTFILE=~/.histfile
-HISTSIZE=2000
-SAVEHIST=2000
+# History: shared live between shells/tmux panes (like the bash history -a/-c/-r setup)
 HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt SHARE_HISTORY HIST_IGNORE_ALL_DUPS HIST_IGNORE_SPACE HIST_REDUCE_BLANKS
 
-# Use vim keybindings and vim as default editor
-bindkey -v
-export VISUAL="/usr/bin/vim"
-export EDITOR="$VISUAL"
+setopt INTERACTIVE_COMMENTS
+# typing a directory name cd's into it (e.g. `..`)
+setopt AUTO_CD
+bindkey -e
 
-# zsh configuration
-source  ~/.powerlevel9k/powerlevel9k.zsh-theme
+# changes cursor to I-beam
+print -n '\e[5 q'
 
-# Left prompt elements
-POWERLEVEL9K_LEFT_PROMPT_ELEMENTS=(context dir dir_writable vcs)
-POWERLEVEL9K_PROMPT_ON_NEWLINE=true
-POWERLEVEL9K_PROMPT_ADD_NEWLINE=true
-POWERLEVEL9K_MULTILINE_FIRST_PROMPT_PREFIX="╭"
-POWERLEVEL9K_MULTILINE_LAST_PROMPT_PREFIX="╰❱❱ "
+# make less more friendly for non-text input files, see lesspipe(1)
+[[ -x /usr/bin/lesspipe ]] && eval "$(SHELL=/bin/sh lesspipe)"
 
-# Right prompt elements
-POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(status root_indicator)
-POWERLEVEL9K_BACKGROUND_JOBS_VERBOSE=true
+# enable color support of ls and also add handy aliases
+if [[ -x /usr/bin/dircolors ]]; then
+    [[ -r ~/.dircolors ]] && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+    alias fgrep='fgrep --color=auto'
+    alias egrep='egrep --color=auto'
+fi
 
-# Prompt elements visual settings
-POWERLEVEL9K_CONTEXT_DEFAULT_FOREGROUND='red'
-POWERLEVEL9K_CONTEXT_DEFAULT_BACKGROUND=''
-POWERLEVEL9K_CONTEXT_ROOT_FOREGROUND='red'
-POWERLEVEL9K_CONTEXT_SUDO_FOREGROUND='red' 
-POWERLEVEL9K_VCS_MODIFIED_FOREGROUND='black'
-POWERLEVEL9K_VCS_MODIFIED_BACKGROUND='red'
-POWERLEVEL9K_ROOT_INDICATOR_BACKGROUND='grey'
+# Completion: arrow-key menu, case-insensitive, ls colors
+autoload -Uz compinit && compinit
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
+zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
 
-# Aliases
+# ls aliases
 alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -l'
 
-alias dev='./dev'
-alias dev-vpn='sudo openvpn --config Foreo.ovpn --verb 8'
-alias dev-acc='sudo vim ~/Documents/Accounts.txt'
+# alias to open files in terminal with xdg-open
+alias open='xdg-open'
 
-# Docker configuration (OS project)
-export OS_XDEBUG_HOST=$(ip route get 1 | awk '{print $3;exit}')
-export OS_APP_PORT=80
-export OS_DOCKER_MOUNT=./:/var/www
-export SCANING_PORT=8081
-export DOCKER_ALL_XDEBUG=$(ip route get 1 | awk '{print $3;exit}')
-export DOCKER_ALL_PORT=8082
+############################################
+# Claude Code auto-compact threshold
+# (same as ~/.bashrc)
+############################################
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
+
+# Vim configuration
+export VISUAL=vim
+export EDITOR="$VISUAL"
+export PATH="$HOME/.local/bin:$PATH"
+
+. "$HOME/.local/bin/env"
+
+# Starship prompt (config: ~/.config/starship.toml). Loaded before the bell hook so its
+# precmd sees the command's real exit status first.
+command -v starship >/dev/null && eval "$(starship init zsh)"
+
+# Ring the bell when a command ran 30s or longer (BELL_AFTER overrides); tmux shows it as a red ! on the window
+autoload -Uz add-zsh-hook
+_bell_preexec() { _bell_cmd_start=$SECONDS }
+_bell_after_long_cmd() {
+    if [[ -n $_bell_cmd_start ]] && (( SECONDS - _bell_cmd_start >= ${BELL_AFTER:-30} )); then
+        print -n '\a'
+    fi
+    unset _bell_cmd_start
+}
+add-zsh-hook preexec _bell_preexec
+add-zsh-hook precmd _bell_after_long_cmd
+
+# Plugin from apt (zsh-autosuggestions). zsh-syntax-highlighting is installed but not loaded.
+[[ -r /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]] &&
+    . /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh

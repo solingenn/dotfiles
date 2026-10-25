@@ -1,0 +1,50 @@
+# Starship prompt, shared by bash and zsh. Docs: https://starship.rs/config/
+# Layout of the original bash PS1 (~/.bashrc.bak-2026-10-25) as a powerline bar:
+#   ╭> dir ▶ branch( * ) ▶   (notched start, arrows between and at the end)
+# The notch is an arrow in colour 232 (#080808), the tmux pane background (window-style).
+#   ╰─❯❯❯          (the >>> pointer, now red after a failed command)
+# Segment backgrounds are the colours the old PS1 text rendered in (gnome-terminal Tango
+# palette, bold is bright): path bold blue = bright-blue #729FCF; the branch red #CC0000 is
+# lifted to bright-red #EF2929 so black text reads on it too.
+# Text is 256-colour 16 (true black; palette "black" is #2E3436): 7.6:1 on the blue, 5.0:1 on
+# the bright red (3.6:1 on #CC0000).
+# The arrows (U+E0B0) and icons (folder U+F07C, branch U+F418) are Nerd Font
+# glyphs; they show as boxes in an editor without that font.
+"$schema" = "https://starship.rs/config-schema.json"
+
+add_newline = false
+continuation_prompt = "> "
+
+format = """
+[╭](fg:bright-blue)[](bg:bright-blue fg:232)$directory$git_branch$git_commit
+[╰─](fg:bright-blue)$character"""
+
+# like bash \w: full path, ~ for home; two spaces after the folder icon, which spills past
+# one cell. Outside a repo the directory closes the bar itself; inside one (repo_root_format)
+# git_branch/git_commit draw the arrow and close it.
+[directory]
+truncation_length = 100
+truncate_to_repo = false
+style = "bold bg:bright-blue fg:16"
+format = "[   $path ]($style)[](fg:bright-blue)"
+repo_root_style = "bold bg:bright-blue fg:16"
+before_repo_root_style = "bold bg:bright-blue fg:16"
+repo_root_format = "[   $before_root_path$repo_root$path ]($style)"
+
+# the old parse_git_dirty compared against git's old "working directory clean"
+# wording, so "( * )" follows the branch in every repo
+[git_branch]
+only_attached = true
+symbol = ""
+style = "bold bg:bright-red fg:16"
+format = '[](fg:bright-blue bg:bright-red)[ $symbol $branch\( * \) ]($style)[](fg:bright-red)'
+
+[git_commit]
+only_detached = true
+style = "bold bg:bright-red fg:16"
+format = '[](fg:bright-blue bg:bright-red)[ \(HEAD detached at $hash\)\( * \) ]($style)[](fg:bright-red)'
+
+# line 2 pointer: bar blue, bright red when the last command failed
+[character]
+success_symbol = "[❯❯❯](bold bright-blue)"
+error_symbol = "[❯❯❯](bold bright-red)"
