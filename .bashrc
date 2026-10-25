@@ -59,9 +59,9 @@ if [ -n "$force_color_prompt" ]; then
     fi
 fi
 
-# Parse git branch
+# Parse git branch; "*" after it when there are staged, unstaged or untracked changes
 parse_git_dirty () {
- [[ $(git status 2> /dev/null | tail -n1) != "nothing to commit, working directory clean" ]] && echo "( * )"
+ [[ -n $(git status --porcelain 2> /dev/null) ]] && echo "*"
 }
 
 parse_git_branch () {
