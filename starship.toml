@@ -1,6 +1,6 @@
 # Starship prompt, shared by bash and zsh. Docs: https://starship.rs/config/
 # Layout of the original bash PS1 (~/.bashrc.bak-2026-10-25) as a powerline bar:
-#   ╭> dir ▶ branch( * ) ▶   (notched start, arrows between and at the end)
+#   ╭─> dir ▶ branch( * ) ▶   (notched start, arrows between and at the end)
 # The notch is an arrow in colour 232 (#080808), the tmux pane background (window-style).
 #   ╰─❯❯❯          (the >>> pointer, now red after a failed command)
 # Segment backgrounds are the colours the old PS1 text rendered in (gnome-terminal Tango
@@ -16,7 +16,7 @@ add_newline = false
 continuation_prompt = "> "
 
 format = """
-[╭](fg:bright-blue)[](bg:bright-blue fg:232)$directory$git_branch$git_commit
+[╭─](fg:bright-blue)[](bg:bright-blue fg:232)$directory$git_branch$git_commit
 [╰─](fg:bright-blue)$character"""
 
 # like bash \w: full path, ~ for home; two spaces after the folder icon, which spills past
