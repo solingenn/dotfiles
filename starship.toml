@@ -51,7 +51,7 @@ description = "* for uncommitted changes, then the git segment's end arrow"
 require_repo = true
 when = true
 shell = ["sh"]
-command = 'if [ -n "$(git status --porcelain 2>/dev/null)" ]; then printf "*"; fi'
+command = 'if [ -n "$(GIT_OPTIONAL_LOCKS=0 git status --porcelain 2>/dev/null)" ]; then printf "*"; fi'
 style = "bold bg:bright-red fg:16"
 format = '[$output ]($style)[](fg:bright-red)'
 

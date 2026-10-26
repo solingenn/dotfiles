@@ -70,6 +70,28 @@ _bell_after_long_cmd() {
 add-zsh-hook preexec _bell_preexec
 add-zsh-hook precmd _bell_after_long_cmd
 
+# Redraw the prompt when this repo's branch or "*" changes outside this pane (an edit or a
+# commit in another pane): checked every 5 seconds while the prompt waits for input.
+# GIT_OPTIONAL_LOCKS=0 keeps these background git status runs off the index lock.
+_git_prompt_key() {
+    local -a lines=(${(f)"$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 --branch 2>/dev/null)"})
+    print -r -- ${(M)lines:#\# branch.(oid|head) *} ${lines[(r)[^#]*]:+*}
+}
+_git_prompt_save() { _git_prompt_last=$(_git_prompt_key) }
+add-zsh-hook precmd _git_prompt_save
+TMOUT=5
+# a non-zero return from a TRAP function interrupts the shell, so every path returns 0
+TRAPALRM() {
+    zle || return 0  # a command is running; precmd checks again when it ends
+    [[ -n $_git_prompt_last ]] || return 0  # not in a repo: skip the git status
+    local key=$(_git_prompt_key)
+    if [[ $key != $_git_prompt_last ]]; then
+        _git_prompt_last=$key
+        zle reset-prompt
+    fi
+    return 0
+}
+
 # Plugin from apt (zsh-autosuggestions). zsh-syntax-highlighting is installed but not loaded.
 [[ -r /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]] &&
     . /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh
