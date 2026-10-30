@@ -1,0 +1,1106 @@
+#!/usr/bin/python3
+"""gnome-terminal font size by monitor.
+
+What it does
+    A gnome-terminal window gets the font size of the monitor it sits on:
+        the laptop's own panel (eDP, 1920x1200)       11pt   "Laptop screen" profile
+        lower resolution: longer side under 2560 px
+            (the 1920x1080 HDMI monitor)               9pt   "Small screen" profile
+        anything else (the 2560x1440 monitors)        10pt   the default profile
+    A window switches about half a second after it stops moving; a new window or tab
+    about a tenth of a second after it appears (after the last one, when several appear
+    in quick succession).
+
+How it works
+    A terminal draws all of its text in one font size, and gnome-terminal sets the font
+    per profile. (Its per-tab zoom goes in 1.2x steps, 10pt to 8.3pt or 12pt, so it can't
+    give 9pt or 11pt.) So this script keeps a profile for each extra size (SIZED_PROFILES)
+    and switches each window between those and the default profile through
+    gnome-terminal's D-Bus interface. That is the same action as the window menu's
+    Terminal > Change Profile.
+
+    - The sized profiles mirror the default profile: every setting except the name, the
+      font and use-system-font is copied from it, at start and whenever the default
+      profile, a sized profile, the profile list or the system monospace font changes.
+      Each one's font is the default profile's font (its own, or the system monospace
+      font if it uses that) at the sized profile's own size. The sizes are absolute, not
+      relative to the default font: with a 9pt default font, "Small screen" would change
+      nothing. Edit the default profile in Preferences; changes made to a sized profile
+      are undone straight away, and a deleted one comes back.
+    - The monitor that counts is the one under the window's top-left corner, not its
+      centre: the corner of its contents, just below the title bar, or of gnome-terminal's
+      own header bar if it uses one. Switching the font resizes a window that isn't
+      maximized: gnome-terminal keeps its rows and columns, so the window grows or shrinks
+      to the right and down while the top-left corner stays put. Measured from the centre,
+      that resize could push the window over a monitor edge, which would switch it back,
+      and so on. (A maximized window, restored after moving to another monitor, gets back
+      its old size in pixels, not its old rows and columns.)
+    - When a grown window no longer fits, the window manager pushes it back onto the
+      monitor or shrinks it, and the rows it loses don't come back. That is likeliest on
+      the laptop panel, which fits the fewest rows. A window dropped right at a monitor
+      edge can be pushed across it; it then switches once more and stays.
+    - Windows are only switched between the sized profiles and the default profile (or
+      one that was the default earlier in this run). A window put on any other profile by
+      hand (Terminal > Change Profile) is left alone; one put on a sized or the default
+      profile by hand goes back to the one its monitor calls for.
+    - Only the active tab switches; a background tab switches when it becomes active.
+    - It sleeps until something happens: a window opened or moved, a tab opened or
+      switched, a monitor changed, a profile or the system monospace font edited. A
+      moving window is left alone until it has stood still for SETTLE_MS, so it doesn't
+      switch back and forth mid-drag; dragging one window doesn't hold up another. A
+      monitor change is also checked after SETTLE_MS, anything else (such as a new window
+      or tab) after SOON_MS.
+
+Installing
+    It belongs with the rest of the shell setup in the dotfiles repo (~/Documents/dotfiles,
+    github.com/solingenn/dotfiles). Like the other dotfiles it is copied into place, not
+    symlinked:
+        ~/.local/bin/terminal-font-by-monitor    this file, executable (chmod +x)
+        ~/.config/autostart/terminal-font-by-monitor.desktop    starts it at login:
+            [Desktop Entry]
+            Type=Application
+            Name=Terminal font by monitor
+            Exec=/home/mario_nardi/.local/bin/terminal-font-by-monitor
+            X-GNOME-Autostart-enabled=true
+    Exec needs the absolute path (desktop files don't expand ~ or $HOME), so fix the
+    home directory in it on a machine with another user name. The script creates the
+    sized profiles itself; there is nothing to set up in gnome-terminal.
+
+Requirements
+    An X11 session (Cinnamon here). It doesn't work on Wayland, where a program can't see
+    other windows' positions. Whole-number display scaling only: with fractional scaling
+    a monitor reports a scaled size and can get the wrong font. Debian/Ubuntu packages:
+    python3-gi, gir1.2-gtk-3.0, gir1.2-wnck-3.0, gir1.2-pango-1.0, python3-xlib,
+    gnome-terminal. Written on Linux Mint 22.3 (Python 3.12, GNOME Terminal 3.52,
+    libwnck 43, PyGObject 3.48).
+
+Running and debugging
+    pgrep -aLF "$XDG_RUNTIME_DIR/terminal-font-by-monitor.lock"    is it running?
+        (When it isn't, pgrep says "pidfile not valid".)
+    pkill -LF "$XDG_RUNTIME_DIR/terminal-font-by-monitor.lock"    stop it
+    terminal-font-by-monitor -v    run it in a terminal, logging every check
+    Only one copy runs at a time and a second one exits with an error, so stop the
+    autostarted copy before running it with -v. Stopping it leaves every window on its
+    current profile.
+
+    The lock file holds the running copy's process id. -L makes pgrep and pkill check
+    that the file is still locked, so a file left over from an earlier run can't point
+    them at some other process. (Avoid `pkill -f terminal-font-by-monitor`: it also
+    kills anything else with that name on its command line, such as an editor or the
+    shell running the command.)
+
+    Started by autostart, it logs to ~/.xsession-errors, each line starting with the date
+    and time to the millisecond:
+        grep terminal-font-by-monitor ~/.xsession-errors
+    It logs starting, stopping, every switch and every change it makes to the profiles,
+    and the warnings of the libraries it uses (GTK, dconf, ...). A window closing or
+    gnome-terminal quitting mid-check is normal and logged only with -v. Any other error
+    talking to gnome-terminal is logged as a warning, once per kind, since it may mean an
+    update changed what this script relies on (see "behaviour this relies on" in the
+    code). While such an error lasts, the windows are checked again every ERROR_RETRY_MS.
+"""
+
+import argparse
+import ctypes
+import fcntl
+import logging
+import os
+import signal
+import sys
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from types import TracebackType
+from typing import ClassVar, NoReturn, TextIO, override
+
+# --- Logging ----------------------------------------------------------------------------
+# Set up before the imports below, so that a missing package is logged like the rest.
+
+APP_NAME = "terminal-font-by-monitor"
+log = logging.getLogger(APP_NAME)
+
+
+class EveryLineFormatter(logging.Formatter):
+    """Starts every line of an entry, traceback lines too, with time, program and level.
+
+    So `grep terminal-font-by-monitor ~/.xsession-errors` finds all of it, and every line
+    says when it happened.
+    """
+
+    @override
+    def format(self, record: logging.LogRecord) -> str:
+        time_text = f"{self.formatTime(record, '%Y-%m-%d %H:%M:%S')}.{int(record.msecs):03d}"
+        prefix = f"{time_text} {record.name}: {record.levelname}: "
+        return "\n".join(prefix + line for line in super().format(record).splitlines())
+
+
+def log_uncaught(exc_type: type[BaseException], exc_value: BaseException,
+                 tb: TracebackType | None) -> None:
+    """sys.excepthook: an error that escapes a callback goes to the log, not bare stderr."""
+    log.critical("unexpected error", exc_info=(exc_type, exc_value, tb))
+
+
+def setup_logging() -> None:
+    """Log to stderr (~/.xsession-errors when autostart starts it), one prefix per line.
+
+    At INFO level; main lowers it to DEBUG for -v once it has read the options.
+    """
+    handler = logging.StreamHandler()
+    handler.setFormatter(EveryLineFormatter("%(message)s"))
+    logging.basicConfig(handlers=[handler], level=logging.INFO)
+    # PyGObject reports an exception raised in a callback through sys.excepthook.
+    sys.excepthook = log_uncaught
+
+
+try:
+    import gi
+    from Xlib import X
+    from Xlib.display import Display as XDisplay
+    from Xlib.error import BadWindow, DisplayError, XError
+
+    # gi needs the library versions pinned before importing them.
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GdkX11", "3.0")
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Pango", "1.0")
+    gi.require_version("Wnck", "3.0")
+    from gi.repository import Gdk, GdkX11, Gio, GLib, Gtk, Pango, Wnck
+except (ImportError, ValueError) as error:  # ValueError: gi has no such library
+    # A package is missing (see Requirements), the likeliest failure on a new machine.
+    setup_logging()
+    log.error("%s (a package is missing; see Requirements at the top of this file)", error)
+    sys.exit(1)
+
+# --- Settings you may want to change ----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SizedProfile:
+    """A copy of the default profile with its own font size, for some monitors."""
+
+    name: str
+    # Fixed, so every run (and every machine these dotfiles go to) reuses the same
+    # profile rather than adding a new one.
+    uuid: str
+    # In points; the font itself is the default profile's. Use whole sizes: 9.5 rendered
+    # squashed.
+    font_size: int
+
+
+# The laptop's own panel: small but sharp, so a bigger font than its resolution suggests.
+LAPTOP_PROFILE = SizedProfile("Laptop screen", "4d3192c9-80ba-40a8-88e0-dcfeb03ca01a", 11)
+# Lower-resolution monitors.
+SMALL_PROFILE = SizedProfile("Small screen", "61d9462b-c446-41e7-a061-25edb620e115", 9)
+# Every profile profile_for returns must be in here, or it isn't mirrored.
+SIZED_PROFILES = (LAPTOP_PROFILE, SMALL_PROFILE)
+
+# Connector-name prefixes that mark a laptop's own panel. xrandr shows it as eDP, eDP-1,
+# LVDS1, DSI-1, ... depending on the driver; some, NVIDIA's for one, use a plain DP-<n>:
+# add that name here, bearing in mind that "DP-1" also matches "DP-10".
+LAPTOP_PANEL_CONNECTORS = ("eDP", "LVDS", "DSI")
+# Other monitors whose longer side has fewer pixels than this count as lower resolution.
+# (The longer side, so a monitor rotated to portrait counts the same.)
+SMALL_BELOW_PX = 2560
+# Dragging a window sends a stream of move events; act once they have paused this long.
+# Also the wait after a monitor change, and before a second try at an ignored switch.
+SETTLE_MS = 500
+# After an error talking to gnome-terminal other than a window closing (a timeout, say),
+# check the windows again this often until it works.
+ERROR_RETRY_MS = 10_000
+# New windows and tabs open on whichever profile they were given; correct them this
+# soon. Not zero, so a burst (several tabs opening at once) is handled in one pass.
+SOON_MS = 100
+
+# --- Program ----------------------------------------------------------------------------
+
+# How long to wait for gnome-terminal to answer a D-Bus call.
+DBUS_TIMEOUT_MS = 2000
+# A new window's first position change this soon after it appears is the window manager
+# placing it (Muffin: 4-19 ms after Wnck reports the window); a later one is a move.
+PLACEMENT_MS = 50
+# GLib's message levels, most severe first, and the levels they go to the log at. (GLib's
+# "error" is fatal; its "critical" means a bug.) Its info and debug messages are left to
+# GLib, which shows them only with G_MESSAGES_DEBUG set.
+GLIB_LOG_LEVELS = (
+    (GLib.LogLevelFlags.LEVEL_ERROR, logging.CRITICAL),
+    (GLib.LogLevelFlags.LEVEL_CRITICAL, logging.ERROR),
+    (GLib.LogLevelFlags.LEVEL_WARNING, logging.WARNING),
+    (GLib.LogLevelFlags.LEVEL_MESSAGE, logging.INFO),
+)
+
+# --- gnome-terminal, GTK and X11 behaviour this relies on -------------------------------
+# If an update breaks one of these, missing settings stop the script with an error, and
+# a changed D-Bus action or reply logs a warning (once per kind). The rest fail quietly,
+# logged with -v at most: windows just don't switch, or switch wrongly.
+
+# Holds the uuids of every profile and of the default profile.
+PROFILES_LIST_SCHEMA = "org.gnome.Terminal.ProfilesList"
+LIST_KEY = "list"
+DEFAULT_KEY = "default"
+# The settings of one profile. The schema is relocatable: each profile keeps its own copy
+# under a dconf path named after its uuid.
+PROFILE_SCHEMA = "org.gnome.Terminal.Legacy.Profile"
+PROFILE_PATH = "/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+VISIBLE_NAME_KEY = "visible-name"
+USE_SYSTEM_FONT_KEY = "use-system-font"
+FONT_KEY = "font"
+# Keys a sized profile sets itself instead of copying them from the default profile
+# (ProfileMirror._own_values).
+OWN_KEYS = (VISIBLE_NAME_KEY, USE_SYSTEM_FONT_KEY, FONT_KEY)
+# The system monospace font, used by profiles with use-system-font.
+INTERFACE_SCHEMA = "org.gnome.desktop.interface"
+MONOSPACE_FONT_KEY = "monospace-font-name"
+# Family for a font description that names none (VTE falls back to it as well).
+FALLBACK_FAMILY = "Monospace"
+# WM_CLASS instance name of terminal windows. (Preferences is a separate process,
+# gnome-terminal-preferences, with its own name.)
+TERMINAL_WM_INSTANCE = "gnome-terminal-server"
+# GTK publishes each application window's actions (what its menus do) on D-Bus under
+# this interface, at <application path>/window/<n>, e.g. /org/gnome/Terminal/window/1.
+# "profile" is a stateful action whose state is the active tab's profile uuid (type s).
+# Setting the state switches the tab to that profile before the D-Bus call returns, or
+# does nothing if gnome-terminal doesn't know the uuid. TerminalWindow.active_profile
+# checks the reply's type.
+ACTIONS_INTERFACE = "org.gtk.Actions"
+PROFILE_ACTION = "profile"
+# Changed(as removed, a{sb} enabled_changes, a{sv} state_changes, a{s(bgav)} added)
+ACTIONS_CHANGED_SIGNATURE = "(asa{sb}a{sv}a{s(bgav)})"
+# X11 properties GTK puts on each application window: where its actions live on D-Bus.
+GTK_BUS_NAME_PROPERTY = "_GTK_UNIQUE_BUS_NAME"
+GTK_WINDOW_PATH_PROPERTY = "_GTK_WINDOW_OBJECT_PATH"
+# With client-side decorations (gnome-terminal's header bar), GTK draws an invisible shadow
+# margin around the window and gives its size in this property: left, right, top, bottom.
+GTK_FRAME_EXTENTS_PROPERTY = "_GTK_FRAME_EXTENTS"
+X_STRING_FORMAT = 8  # X11 property format of strings: 8 bits per item
+X_CARDINAL_FORMAT = 32  # ... and of numbers
+# X11 request numbers from here up are extensions'; the minor number then says which of the
+# extension's requests it was.
+X_FIRST_EXTENSION_REQUEST = 128
+# D-Bus errors that only mean a window or gnome-terminal went away between an event and the
+# check: a closed window answers UNKNOWN_METHOD, a quit gnome-terminal SERVICE_UNKNOWN.
+GONE_DBUS_ERRORS = (
+    Gio.DBusError.SERVICE_UNKNOWN, Gio.DBusError.NAME_HAS_NO_OWNER,
+    Gio.DBusError.UNKNOWN_METHOD, Gio.DBusError.UNKNOWN_OBJECT,
+    Gio.DBusError.UNKNOWN_INTERFACE,
+)
+# On X11, GDK names each monitor ("model") after its RandR monitor, which for an ordinary
+# monitor is its output's connector name (eDP, HDMI-A-0, ...): that is how the laptop
+# panel is recognised (X11Windows.monitor).
+
+# The log domain of dconf's messages, such as "failed to commit changes to dconf".
+DCONF_LOG_DOMAIN = "dconf"
+
+
+@dataclass(frozen=True)
+class Monitor:
+    """A monitor, as far as choosing a profile goes."""
+
+    connector: str  # the name of its output: eDP, HDMI-A-0, ...
+    width_px: int
+    height_px: int
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.connector} ({self.width_px}x{self.height_px})"
+
+
+def profile_for(monitor: Monitor) -> SizedProfile | None:
+    """The sized profile for a monitor, or None for the default profile."""
+    if monitor.connector.startswith(LAPTOP_PANEL_CONNECTORS):
+        return LAPTOP_PROFILE
+    if max(monitor.width_px, monitor.height_px) < SMALL_BELOW_PX:
+        return SMALL_PROFILE
+    return None
+
+
+def with_size(font: str, points: int) -> str:
+    """The Pango font description `font` resized to `points` points.
+
+    A description without a family gets FALLBACK_FAMILY.
+    """
+    description = Pango.FontDescription.from_string(font)
+    if not description.get_family():
+        description.set_family(FALLBACK_FAMILY)
+    description.set_size(points * Pango.SCALE)
+    return description.to_string()
+
+
+def profile_settings(uuid: str) -> Gio.Settings:
+    """The dconf-backed settings of the gnome-terminal profile with this uuid."""
+    return Gio.Settings.new_with_path(PROFILE_SCHEMA, PROFILE_PATH.format(uuid=uuid))
+
+
+def settings_problem() -> str | None:
+    """Why the settings this script needs can't be used here, or None if they can.
+
+    GLib treats a missing settings schema or key as a programming error and aborts the
+    process, so check before touching them.
+    """
+    source = Gio.SettingsSchemaSource.get_default()
+    if source is None:
+        return "no settings schemas are installed"
+    needed = {
+        PROFILES_LIST_SCHEMA: (LIST_KEY, DEFAULT_KEY),
+        PROFILE_SCHEMA: OWN_KEYS,
+        INTERFACE_SCHEMA: (MONOSPACE_FONT_KEY,),
+    }
+    for schema_id, keys in needed.items():
+        schema = source.lookup(schema_id, recursive=True)
+        if schema is None:
+            return f"settings schema {schema_id} is not installed (is gnome-terminal?)"
+        missing = [key for key in keys if not schema.has_key(key)]
+        if missing:
+            return f"settings schema {schema_id} has no {', '.join(missing)}"
+    return None
+
+
+class UnexpectedReply(Exception):
+    """gnome-terminal sent a reply this script can't read (did an update change it?)."""
+
+
+class WindowGone(Exception):
+    """The window closed while it was being looked up."""
+
+
+def window_gone(error: Exception) -> bool:
+    """Whether an error only means that the window, or gnome-terminal, has gone away."""
+    if isinstance(error, BadWindow | WindowGone):
+        return True
+    return isinstance(error, GLib.Error) and any(
+        error.matches(Gio.DBusError.quark(), code) for code in GONE_DBUS_ERRORS)
+
+
+def describe(error: Exception) -> str:
+    """An error as the log shows it; also how _warn_once tells kinds of error apart.
+
+    python-xlib's own text for an X error is its class followed by every field, including
+    the sequence number of the request, so no two would read the same.
+    """
+    if isinstance(error, XError):
+        kind = "of an unknown kind" if type(error) is XError else type(error).__name__
+        request = str(error.major_opcode)
+        if error.major_opcode >= X_FIRST_EXTENSION_REQUEST:
+            request += f".{error.minor_opcode}"
+        return f"X error {kind} (code {error.code}, request {request})"
+    return str(error)
+
+
+class Debouncer:
+    """Calls a function once a burst of triggers has paused for a while."""
+
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self._callback = callback
+        self._source = 0  # the pending GLib timeout, or 0
+
+    def trigger(self, delay_ms: int) -> None:
+        """Call the function `delay_ms` from now, replacing a pending call."""
+        self.cancel()
+        self._source = GLib.timeout_add(delay_ms, self._run)
+
+    def cancel(self) -> None:
+        """Drop the pending call, if any."""
+        if self._source:
+            GLib.source_remove(self._source)
+            self._source = 0
+
+    @property
+    def pending(self) -> bool:
+        """Whether a call is due."""
+        return self._source != 0
+
+    def _run(self) -> bool:
+        self._source = 0
+        self._callback()
+        return GLib.SOURCE_REMOVE  # one-shot
+
+
+class ProfileMirror:
+    """Keeps each sized profile a copy of the default profile, apart from name and font.
+
+    start does a first sync, and from then on any change to the profile list, the default
+    profile, a sized profile or the system monospace font schedules a full sync (_sync).
+    A sync puts missing sized profiles back in the list, follows a change of default
+    profile, sets each sized profile's own keys (_own_values) and copies every other key
+    from the default profile. It writes only values that differ, so the changes it causes
+    itself lead to one more sync that finds nothing to do.
+    """
+
+    # Wait this long for a burst of changes to end: Preferences writes keys one at a time.
+    SYNC_DELAY_MS: ClassVar[int] = 200
+    # When the mirror's writes keep being undone (dconf failing to save, or another program
+    # writing the same keys), the delay doubles with every sync that has to redo a write
+    # (backoff), up to this: seldom enough not to keep dconf and gnome-terminal busy, often
+    # enough that the profiles are right again soon after the cause goes away. Backoff only
+    # delays syncs for changes to what the mirror writes (the profile list, the sized
+    # profiles). Changes to what it only reads (which profile is the default, that profile,
+    # the system monospace font) are never its own echo and always sync after
+    # SYNC_DELAY_MS.
+    MAX_SYNC_DELAY_MS: ClassVar[int] = 30_000
+    # Log a warning once this many syncs in a streak had to redo a write.
+    WARN_AFTER_UNDONE_SYNCS: ClassVar[int] = 3
+    # A streak of syncs redoing writes ends once the mirror has written nothing for this
+    # long. Longer than MAX_SYNC_DELAY_MS, so that syncs at that delay stay one streak.
+    CALM_MS: ClassVar[int] = 2 * MAX_SYNC_DELAY_MS
+
+    def __init__(self, sized_profiles: Sequence[SizedProfile]) -> None:
+        self.default_uuid = ""
+        # Profiles windows may be switched between: the sized profiles and every profile
+        # that was the default during this run (windows still on an earlier default would
+        # otherwise count as picked by hand).
+        self.managed_uuids = {profile.uuid for profile in sized_profiles}
+        # See start.
+        self._on_profiles_changed: Callable[[], None] = lambda: None
+
+        self._profiles = Gio.Settings.new(PROFILES_LIST_SCHEMA)
+        self._copies = [(profile, profile_settings(profile.uuid))
+                        for profile in sized_profiles]
+        self._interface = Gio.Settings.new(INTERFACE_SCHEMA)
+        self._default: Gio.Settings | None = None
+        self._default_handler = 0
+        self._rejected_default = ""  # last unusable default, so it is logged only once
+        self._debouncer = Debouncer(self._sync)
+        # Whether the pending sync is for an edit (_on_source_changed), and so due soon.
+        self._edit_pending = False
+        # What the current sync and the last sync that wrote anything wrote, as (dconf path,
+        # key, value).
+        self._writes: set[tuple[str, str, str | None]] = set()
+        self._previous_writes: set[tuple[str, str, str | None]] = set()
+        # Syncs in the current streak that redid a write, and the backoff: how long a
+        # change to what the mirror writes waits for its sync (see _track_undone_writes).
+        self._undone_syncs = 0
+        self._backoff_ms = self.SYNC_DELAY_MS
+        self._calm = Debouncer(self._calm_down)
+
+    def start(self, on_profiles_changed: Callable[[], None]) -> None:
+        """Sync now, then whenever something changes.
+
+        `on_profiles_changed` is called when windows need another check: the default
+        profile changed, or a sized profile was put back in the list (gnome-terminal
+        ignores switches to a profile that isn't in it).
+        """
+        self._on_profiles_changed = on_profiles_changed
+        # GSettings only reports changes to keys that were read while a "changed" handler
+        # was connected, so connect first: the sync below reads every key.
+        self._profiles.connect(f"changed::{LIST_KEY}", self._on_written_changed)
+        self._profiles.connect(f"changed::{DEFAULT_KEY}", self._on_source_changed)
+        for _, settings in self._copies:
+            settings.connect("changed", self._on_written_changed)
+        self._interface.connect(f"changed::{MONOSPACE_FONT_KEY}", self._on_source_changed)
+        self._sync()
+
+    @property
+    def fighting(self) -> bool:
+        """Whether writes have kept being undone for long enough to have warned about it."""
+        return self._undone_syncs >= self.WARN_AFTER_UNDONE_SYNCS
+
+    def quiet_level(self, level: int) -> int:
+        """`level`, or DEBUG while the mirror is fighting.
+
+        For messages that every redone write would log again, without end.
+        """
+        return logging.DEBUG if self.fighting else level
+
+    def _on_written_changed(self, _settings: Gio.Settings, _key: str) -> None:
+        """A change to settings the mirror writes: maybe its own echo, maybe undone."""
+        if self._edit_pending:
+            # The sync for that edit, due soon, covers this change too; the backoff mustn't
+            # put it off (`dconf load` can change the default profile and the list
+            # together).
+            return
+        self._debouncer.trigger(self._backoff_ms)
+
+    def _on_source_changed(self, _settings: Gio.Settings, _key: str) -> None:
+        """A change to settings the mirror only reads: someone edited them."""
+        self._edit_pending = True
+        self._debouncer.trigger(self.SYNC_DELAY_MS)
+
+    def _sync(self) -> None:
+        self._edit_pending = False
+        self._writes = set()
+        uuids, restored = self._restore_list()
+        default_changed = self._follow_default(uuids)
+        default_font = self._default_font()
+        for profile, settings in self._copies:
+            self._mirror_into(profile, settings, default_font)
+        self._track_undone_writes()
+        if restored or default_changed:
+            self._on_profiles_changed()
+
+    def _restore_list(self) -> tuple[list[str], bool]:
+        """Put missing sized profiles back in the list.
+
+        Returns the list, and whether any profile was put back.
+        """
+        uuids = self._profiles.get_strv(LIST_KEY)
+        missing = [profile for profile, _ in self._copies if profile.uuid not in uuids]
+        if missing:
+            log.log(self.quiet_level(logging.INFO), "adding profiles: %s",
+                    ", ".join(repr(profile.name) for profile in missing))
+            uuids = [*uuids, *(profile.uuid for profile in missing)]
+            self._set(self._profiles, LIST_KEY, GLib.Variant("as", uuids))
+        return uuids, bool(missing)
+
+    def _mirror_into(self, profile: SizedProfile, settings: Gio.Settings,
+                     default_font: str) -> None:
+        """Make one sized profile a copy of the default profile with its own name and font."""
+        own = self._own_values(profile, default_font)
+        for key, value in own.items():
+            if self._set(settings, key, value) and key == FONT_KEY:
+                log.log(self.quiet_level(logging.INFO), "%r font: %s",
+                        profile.name, value.get_string())
+        if self._default is not None:
+            for key in self._default.props.settings_schema.list_keys():
+                if key not in own:
+                    self._set(settings, key, self._default.get_user_value(key))
+
+    def _track_undone_writes(self) -> None:
+        """Count syncs that had to redo a write, for the backoff and the warning.
+
+        The streak, and so the count, ends once the mirror goes CALM_MS without writing.
+        """
+        if not self._writes:
+            # Nothing to write, as in the sync that echoes the mirror's own writes. That
+            # they are in place now doesn't mean they will stay (whatever undoes them may
+            # be slower), so this sync neither counts nor ends the streak.
+            return
+        # Writing a key to the same value as the last sync that wrote anything means
+        # someone undid that write in between.
+        if self._writes & self._previous_writes:
+            self._undone_syncs += 1
+            self._backoff_ms = min(2 * self._backoff_ms, self.MAX_SYNC_DELAY_MS)
+            if self._undone_syncs == self.WARN_AFTER_UNDONE_SYNCS:
+                log.warning("profile settings keep reverting (is dconf failing to save?); "
+                            "retrying less and less often, down to every %d s, and logging "
+                            "the retries with -v only", self.MAX_SYNC_DELAY_MS // 1000)
+        self._previous_writes = self._writes
+        self._calm.trigger(self.CALM_MS)
+
+    def _calm_down(self) -> None:
+        """CALM_MS without writes: the streak is over."""
+        if self.fighting:
+            log.info("profile settings are saved again")
+        self._undone_syncs = 0
+        self._backoff_ms = self.SYNC_DELAY_MS
+        self._previous_writes = set()
+
+    @staticmethod
+    def _own_values(profile: SizedProfile, default_font: str) -> dict[str, GLib.Variant]:
+        """The keys a sized profile sets itself, and their values."""
+        return {
+            VISIBLE_NAME_KEY: GLib.Variant("s", profile.name),
+            USE_SYSTEM_FONT_KEY: GLib.Variant("b", False),
+            FONT_KEY: GLib.Variant("s", with_size(default_font, profile.font_size)),
+        }
+
+    def _default_font(self) -> str:
+        """The font the default profile shows: its own, or the system monospace font."""
+        if self._default is None or self._default.get_boolean(USE_SYSTEM_FONT_KEY):
+            return self._interface.get_string(MONOSPACE_FONT_KEY)
+        return self._default.get_string(FONT_KEY)
+
+    def _follow_default(self, uuids: Sequence[str]) -> bool:
+        """Start mirroring the default profile if it changed since the last sync.
+
+        `uuids` is the profile list. An unusable default is logged once and ignored, so
+        the previous one stays. Returns whether it started mirroring another profile.
+        """
+        uuid = self._profiles.get_string(DEFAULT_KEY)
+        if uuid == self.default_uuid:
+            self._rejected_default = ""
+            return False
+        if (reason := self._unusable_reason(uuid, uuids)) is not None:
+            if uuid != self._rejected_default:
+                self._rejected_default = uuid
+                log.warning("can't mirror default profile %r: %s", uuid, reason)
+            return False
+        self._rejected_default = ""
+        settings = profile_settings(uuid)
+        handler = settings.connect("changed", self._on_source_changed)
+        if self._default is not None:
+            self._default.disconnect(self._default_handler)
+        self._default, self._default_handler = settings, handler
+        self.default_uuid = uuid
+        self.managed_uuids.add(uuid)
+        log.info("mirroring default profile %s into %s", uuid,
+                 ", ".join(repr(profile.name) for profile, _ in self._copies))
+        return True
+
+    def _unusable_reason(self, uuid: str, uuids: Sequence[str]) -> str | None:
+        """Why profile `uuid` can't be mirrored as the default, or None if it can."""
+        sized = next((profile for profile, _ in self._copies if profile.uuid == uuid), None)
+        if sized is not None:
+            return f"it is the sized profile {sized.name!r}; pick another default"
+        if not GLib.uuid_string_is_valid(uuid):
+            return "not a valid uuid"
+        if uuid not in uuids:
+            # gnome-terminal has no such profile, so there is nothing to copy. (Preferences
+            # may add it to the list a moment later; the next sync looks again.)
+            return "not in the profile list"
+        return None
+
+    def _set(self, settings: Gio.Settings, key: str, value: GLib.Variant | None) -> bool:
+        """Give a key this value (None: reset it to the schema default) if it differs.
+
+        Returns whether it wrote. Writing only real changes matters: gnome-terminal applies
+        every write to the tabs using that profile, and every write makes the mirror sync
+        again.
+        """
+        if settings.get_user_value(key) == value:
+            return False
+        if value is None:
+            settings.reset(key)
+        elif not settings.set_value(key, value):
+            log.warning("can't write %s%s: it is locked", settings.props.path, key)
+            return False
+        text = value.print_(type_annotate=True) if value is not None else None
+        self._writes.add((settings.props.path, key, text))
+        return True
+
+
+@dataclass(frozen=True)
+class TerminalWindow:
+    """One gnome-terminal window, reached through its GTK actions on D-Bus."""
+
+    bus: Gio.DBusConnection
+    bus_name: str  # unique bus name of the gnome-terminal-server that owns the window
+    path: str  # e.g. /org/gnome/Terminal/window/1
+
+    def active_profile(self) -> str:
+        """The uuid of the active tab's profile."""
+        reply = self._call("Describe", GLib.Variant("(s)", (PROFILE_ACTION,)), "((bgav))")
+        _enabled, parameter_type, state = reply.unpack()[0]
+        if parameter_type != "s" or len(state) != 1 or not isinstance(state[0], str):
+            raise UnexpectedReply(f"the {PROFILE_ACTION!r} action takes {parameter_type!r} "
+                                  f"and holds {state!r}, not a profile uuid")
+        return state[0]
+
+    def set_active_profile(self, uuid: str) -> None:
+        """Switch the active tab to the profile with this uuid."""
+        self._call("SetState",
+                   GLib.Variant("(sva{sv})", (PROFILE_ACTION, GLib.Variant("s", uuid), {})))
+
+    def _call(self, method: str, parameters: GLib.Variant,
+              reply_type: str | None = None) -> GLib.Variant:
+        # The destination is a unique bus name, which D-Bus never starts a program for,
+        # so a call can't launch gnome-terminal.
+        return self.bus.call_sync(
+            self.bus_name, self.path, ACTIONS_INTERFACE, method, parameters,
+            reply_type=GLib.VariantType(reply_type) if reply_type else None,
+            flags=Gio.DBusCallFlags.NONE, timeout_msec=DBUS_TIMEOUT_MS, cancellable=None)
+
+
+class X11Windows:
+    """Looks up what a window id stands for: its D-Bus address and its monitor."""
+
+    def __init__(self, display: GdkX11.X11Display) -> None:
+        self._display = display
+        # GDK has no call that PyGObject can use to read another program's window
+        # properties, so this opens its own connection to the same X server.
+        self._x = XDisplay(display.get_name())
+        self._bus_name_atom = self._x.intern_atom(GTK_BUS_NAME_PROPERTY)
+        self._path_atom = self._x.intern_atom(GTK_WINDOW_PATH_PROPERTY)
+        self._frame_extents_atom = self._x.intern_atom(GTK_FRAME_EXTENTS_PROPERTY)
+
+    def terminal(self, bus: Gio.DBusConnection, xid: int) -> TerminalWindow | None:
+        """The window with this id as a GTK window on D-Bus, or None if it isn't one.
+
+        Raises XError if the window has closed.
+        """
+        self._drop_events()
+        bus_name = self._string_property(xid, self._bus_name_atom)
+        path = self._string_property(xid, self._path_atom)
+        if not bus_name or not path:
+            return None
+        return TerminalWindow(bus, bus_name, path)
+
+    def monitor(self, xid: int) -> Monitor:
+        """The monitor under the window's visible top-left corner, or the nearest one.
+
+        Raises WindowGone, or XError, if the window has closed.
+        """
+        try:
+            window = GdkX11.X11Window.foreign_new_for_display(self._display, xid)
+        except TypeError:  # GDK returns NULL for a window that no longer exists
+            raise WindowGone("GDK can't find it") from None
+        # GDK treats an X error on its own connection as fatal and exits, and the window
+        # can close at any moment, so trap the error instead.
+        self._display.error_trap_push()
+        try:
+            _, x, y = window.get_origin()
+        finally:
+            failed = self._display.error_trap_pop()
+        if failed:  # x and y mean nothing
+            raise WindowGone("X error reading its position")
+        # Skip the invisible shadow margin of a window with client-side decorations. The
+        # origin and the monitor layout are in GDK's (scaled) coordinates, the margin in
+        # pixels.
+        left, top = self._shadow_margin(xid)
+        window_scale = window.get_scale_factor()
+        monitor = self._display.get_monitor_at_point(x + left // window_scale,
+                                                     y + top // window_scale)
+        # Its (whole-number) scale factor turns its geometry back into pixels.
+        geometry, scale = monitor.get_geometry(), monitor.get_scale_factor()
+        return Monitor(monitor.get_model() or "", geometry.width * scale,
+                       geometry.height * scale)
+
+    def _drop_events(self) -> None:
+        """Drop the events the X server has sent this connection.
+
+        It never asks for any, but the server sends some to every client anyway (keyboard
+        mapping changes), and they would pile up.
+        """
+        while self._x.pending_events():
+            self._x.next_event()
+
+    def _shadow_margin(self, xid: int) -> tuple[int, int]:
+        """The left and top shadow margin of a window with client-side decorations."""
+        value = self._property(xid, self._frame_extents_atom, X_CARDINAL_FORMAT)
+        if value is None or len(value) != 4:  # not the four numbers GTK writes
+            return 0, 0
+        left, _right, top, _bottom = value
+        return left, top
+
+    def _string_property(self, xid: int, atom: int) -> str | None:
+        """A string property of a window, or None if it has none."""
+        value = self._property(xid, atom, X_STRING_FORMAT)
+        return None if value is None else bytes(value).decode(errors="replace")
+
+    def _property(self, xid: int, atom: int, item_bits: int) -> Sequence[int] | None:
+        """A property of a window, or None if it has none with items of that size."""
+        window = self._x.create_resource_object("window", xid)
+        prop = window.get_full_property(atom, X.AnyPropertyType)
+        return prop.value if prop is not None and prop.format == item_bits else None
+
+
+@dataclass
+class WatchedWindow:
+    """What ProfileSwitcher keeps about a terminal window."""
+
+    # Checks the window SETTLE_MS after its last move; pending while it is moving.
+    settle: Debouncer
+    # Where its contents were last seen: top-left corner, root coordinates.
+    position: tuple[int, int]
+    # When it appeared (time.monotonic()), until its placement or first check. Its first
+    # position change within PLACEMENT_MS, and before that check, is the window manager
+    # placing it, not a move; after the check it counts as a move, so the new position
+    # gets checked. (A window opened at a given position is never placed.)
+    appeared_at: float | None
+    # Whether gnome-terminal ignored a switch and the window gets a second try.
+    retried: bool = False
+
+
+class ProfileSwitcher:
+    """Puts every terminal window on the profile its monitor calls for.
+
+    Events only schedule checks. A window that moves is checked SETTLE_MS after its last
+    move, by its own timer. Everything else schedules a check of all terminal windows
+    (_check_all): SOON_MS ahead for a new window, a change of the "profile" action (a new
+    tab, a tab switch, a pick from the menu, this script's own switch) or a profile change
+    from the mirror; SETTLE_MS ahead for a monitor change or a second try at an ignored
+    switch; ERROR_RETRY_MS ahead after an error. That check skips moving windows, which
+    their own timers cover. There are only a few windows, and one pass over all of them is
+    simpler than working out which window an event was for.
+    """
+
+    def __init__(self, mirror: ProfileMirror, x11: X11Windows, bus: Gio.DBusConnection,
+                 wnck_screen: Wnck.Screen, gdk_screen: Gdk.Screen) -> None:
+        self._mirror = mirror
+        self._x11 = x11
+        self._bus = bus
+        self._wnck_screen = wnck_screen
+        self._gdk_screen = gdk_screen
+        # Checks of all windows, one timer per delay, so that a trigger with a long delay
+        # can't push back a pending short one. Moving windows have their own timers
+        # (WatchedWindow.settle), so a stream of move events can't postpone these either.
+        self._soon = Debouncer(self._check_all)
+        self._settled = Debouncer(self._check_all)
+        self._error_retry = Debouncer(self._check_all)
+        # The terminal windows, by window id.
+        self._watched: dict[int, WatchedWindow] = {}
+        # Errors already logged as warnings; repeats go to the debug log.
+        self._warned: set[str] = set()
+
+    def start(self) -> None:
+        """Watch the terminal windows open now and from now on, and check them soon."""
+        # Wnck reports windows as they open, move and close.
+        self._wnck_screen.connect("window-opened", lambda _screen, window: self._watch(window))
+        self._wnck_screen.connect("window-closed", lambda _screen, window: self._forget(window))
+        for window in self._wnck_screen.get_windows():
+            self._watch(window)
+        # A monitor plugged in, unplugged, moved or set to another resolution.
+        self._gdk_screen.connect("monitors-changed", lambda _screen: self._schedule_settled())
+        # gnome-terminal announces changes to the "profile" action's state, which follows
+        # the active tab: a new tab, a tab switch, or a profile picked from the menu. From
+        # any sender, path and arg0 (the Nones; PyGObject takes no keyword arguments here),
+        # because gnome-terminal's unique bus name changes when it restarts.
+        self._bus.signal_subscribe(None, ACTIONS_INTERFACE, "Changed", None, None,
+                                   Gio.DBusSignalFlags.NONE, self._on_actions_changed)
+        self.schedule_soon()
+
+    def schedule_soon(self) -> None:
+        """Check all windows that aren't moving, SOON_MS from now."""
+        self._soon.trigger(SOON_MS)
+
+    def _schedule_settled(self) -> None:
+        """Check all windows that aren't moving, SETTLE_MS from now.
+
+        For a monitor change, and for a second try at a switch gnome-terminal ignored.
+        """
+        self._settled.trigger(SETTLE_MS)
+
+    def _watch(self, window: Wnck.Window) -> None:
+        if window.get_class_instance_name() != TERMINAL_WM_INSTANCE:
+            return
+        xid = window.get_xid()
+        self._watched[xid] = WatchedWindow(settle=Debouncer(partial(self._check_window, xid)),
+                                           position=self._position(window),
+                                           appeared_at=time.monotonic())
+        window.connect("geometry-changed", self._on_geometry_changed)
+        self.schedule_soon()
+
+    def _forget(self, window: Wnck.Window) -> None:
+        if (watched := self._watched.pop(window.get_xid(), None)) is not None:
+            watched.settle.cancel()
+
+    @staticmethod
+    def _position(window: Wnck.Window) -> tuple[int, int]:
+        x, y, _width, _height = window.get_client_window_geometry()
+        return x, y
+
+    def _on_geometry_changed(self, window: Wnck.Window) -> None:
+        watched, position = self._watched.get(window.get_xid()), self._position(window)
+        if watched is None or position == watched.position:
+            # Resized in place, e.g. by a font switch: the monitor under the top-left
+            # corner is the same, so there is nothing to check.
+            return
+        watched.position = position
+        appeared_at, watched.appeared_at = watched.appeared_at, None
+        if appeared_at is not None and time.monotonic() - appeared_at < PLACEMENT_MS / 1000:
+            # Placed by the window manager. Its first check, already scheduled by _watch,
+            # reads the position as it is then.
+            return
+        watched.settle.trigger(SETTLE_MS)
+
+    def _on_actions_changed(self, _bus: Gio.DBusConnection, _sender: str | None, _path: str,
+                            _interface: str, _signal: str, parameters: GLib.Variant) -> None:
+        # Every GTK application's windows send this signal; only a change of the
+        # "profile" state matters. Check the signal's type first: any program can send
+        # anything.
+        if parameters.get_type_string() != ACTIONS_CHANGED_SIGNATURE:
+            return
+        if parameters.get_child_value(2).lookup_value(PROFILE_ACTION, None) is not None:
+            self.schedule_soon()
+
+    def _check_all(self) -> None:
+        """Check every terminal window except the moving ones."""
+        for xid, watched in self._watched.items():
+            if watched.settle.pending:
+                log.debug("window %#x: moving, left to the check after the move", xid)
+                continue
+            self._check_window(xid)
+
+    def _check_window(self, xid: int) -> None:
+        """Check one window, logging its errors so the other windows still get checked."""
+        watched = self._watched[xid]
+        watched.appeared_at = None  # from now on a position change is a move
+        try:
+            self._check(xid, watched)
+        except (GLib.Error, XError, UnexpectedReply, WindowGone) as error:
+            text = describe(error)
+            if window_gone(error):  # closed, or gnome-terminal quit, since the event
+                log.debug("window %#x is gone: %s", xid, text)
+            else:  # a timeout, or gnome-terminal changed: worth knowing, once
+                self._warn_once(text, "window %#x: %s", xid, text)
+                self._error_retry.trigger(ERROR_RETRY_MS)
+        except Exception:
+            # A bug. Log it and go on with the other windows rather than skip them.
+            log.exception("window %#x: unexpected error", xid)
+
+    def _warn_once(self, key: str, message: str, *args: object) -> None:
+        """Log a warning the first time for this key, and at debug level after that."""
+        if key in self._warned:
+            log.debug(message, *args)
+            return
+        self._warned.add(key)
+        log.warning(message + " (repeats are logged with -v only)", *args)
+
+    def _check(self, xid: int, watched: WatchedWindow) -> None:
+        """Switch the window's active tab to its monitor's profile, unless picked by hand."""
+        default_uuid = self._mirror.default_uuid
+        if not default_uuid:  # no usable default profile: the mirror logged why
+            return
+        terminal = self._x11.terminal(self._bus, xid)
+        if terminal is None:
+            log.debug("window %#x has no GTK D-Bus address, skipping it", xid)
+            return
+        current = terminal.active_profile()
+        if current not in self._mirror.managed_uuids:
+            log.debug("window %#x: profile %s was picked by hand, leaving it", xid, current)
+            return
+        monitor = self._x11.monitor(xid)
+        profile = profile_for(monitor)
+        if profile is None:
+            wanted, name = default_uuid, "default"
+        else:
+            wanted, name = profile.uuid, repr(profile.name)
+        where = f"window {xid:#x} on {monitor}"
+        if current == wanted:
+            watched.retried = False
+            log.debug("%s: already on the %s profile", where, name)
+            return
+        terminal.set_active_profile(wanted)
+        if terminal.active_profile() == wanted:
+            watched.retried = False
+            log.info("%s: switched to the %s profile", where, name)
+            return
+        # gnome-terminal ignores a profile that isn't in its list yet, e.g. one the mirror
+        # has just put back after it was deleted, so the window gets a second try. While
+        # the mirror is fighting, the profile may never get there, and each of the
+        # mirror's syncs would log the lines below again: quiet_level keeps them at debug
+        # level then.
+        if not watched.retried:
+            watched.retried = True
+            log.log(self._mirror.quiet_level(logging.INFO),
+                    "%s: gnome-terminal didn't take the %s profile, trying again", where, name)
+            self._schedule_settled()
+        else:
+            watched.retried = False
+            log.log(self._mirror.quiet_level(logging.WARNING),
+                    "%s: gnome-terminal didn't switch to the %s profile", where, name)
+
+
+def glib_field_text(field: GLib.LogField) -> str:
+    """The value of a field of a GLib message as text (PyGObject gives its bare address)."""
+    if not field.value:
+        return ""
+    # A length of -1 means a NUL-terminated string, for GLib and string_at alike.
+    return ctypes.string_at(field.value, field.length).decode(errors="replace")
+
+
+def log_glib_messages(dconf_level: Callable[[int], int]) -> None:
+    """Send the messages of the libraries this uses (GLib, GTK, dconf, ...) to the log.
+
+    Otherwise GLib prints them itself, in its own format and regardless of -v. Info and
+    debug messages stay with GLib (GLIB_LOG_LEVELS). `dconf_level` turns the level of a
+    dconf message into the one to log it at: dconf warns about every write it fails to
+    save, and the mirror keeps redoing them (ProfileMirror.quiet_level).
+    """
+
+    def write(level: GLib.LogLevelFlags, fields: Sequence[GLib.LogField], _n_fields: int,
+              user_data: None) -> GLib.LogWriterOutput:
+        log_level = next((log_level for glib_level, log_level in GLIB_LOG_LEVELS
+                          if level & glib_level), None)
+        if log_level is None:
+            return GLib.log_writer_default(level, fields, user_data)
+        text = {field.key: glib_field_text(field) for field in fields
+                if field.key in ("GLIB_DOMAIN", "MESSAGE")}
+        message = text.get("MESSAGE", "")
+        if domain := text.get("GLIB_DOMAIN"):
+            message = f"{domain}: {message}"
+            if domain == DCONF_LOG_DOMAIN:
+                log_level = dconf_level(log_level)
+        log.log(log_level, "%s", message)
+        return GLib.LogWriterOutput.HANDLED
+
+    GLib.log_set_writer_func(write, None)
+
+
+class LoggingArgumentParser(argparse.ArgumentParser):
+    """An argument parser that logs a bad option, with the prefix, instead of printing it."""
+
+    @override
+    def error(self, message: str) -> NoReturn:
+        log.error("%s (see --help)", message)
+        sys.exit(2)
+
+
+def hold_lock(path: Path) -> TextIO | None:
+    """Lock the lock file and write this process's id in it; None if that fails.
+
+    The lock holds while the returned file stays open, and goes when the process ends in
+    any way, so a crash never leaves a stale lock behind.
+    """
+    try:
+        # "a+", not "w": opening must not empty the file while another copy holds it.
+        lock = path.open("a+")
+    except OSError as error:
+        log.error("can't open the lock file: %s", error)
+        return None
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        log.error("already running (%s is locked)", path)
+        return None
+    # For pgrep/pkill -LF, see the top of this file.
+    lock.truncate(0)
+    lock.write(f"{os.getpid()}\n")
+    lock.flush()
+    return lock
+
+
+def main() -> int:
+    # Logging first, so that even a mistyped option (in the autostart file, say) reaches
+    # the log with the prefix.
+    setup_logging()
+    parser = LoggingArgumentParser(
+        description="Give each gnome-terminal window the font size of the monitor it is "
+                    "on. Runs until stopped; see the top of the script for details.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="log every check, not just switches")
+    if parser.parse_args().verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # Wnck needs GTK initialised. Importing Gtk through PyGObject already did that; asking
+    # again is harmless and says whether it worked.
+    initialised, _argv = Gtk.init_check()
+    display = Gdk.Display.get_default()
+    if not initialised or not isinstance(display, GdkX11.X11Display):
+        log.error("needs an X11 session (no display, or this is Wayland)")
+        return 1
+    if (problem := settings_problem()) is not None:
+        log.error("%s", problem)
+        return 1
+    if (lock := hold_lock(Path(GLib.get_user_runtime_dir()) / f"{APP_NAME}.lock")) is None:
+        return 1
+
+    with lock:
+        log.info("started (process %d)", os.getpid())
+        mirror = ProfileMirror(SIZED_PROFILES)
+        log_glib_messages(dconf_level=mirror.quiet_level)
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        except GLib.Error as error:
+            log.error("can't connect to the session bus: %s", error.message)
+            return 1
+        try:
+            x11 = X11Windows(display)
+        except DisplayError as error:
+            log.error("can't open a second connection to the X server: %s", error)
+            return 1
+        wnck_screen = Wnck.Screen.get_default()
+        wnck_screen.force_update()  # load the current window list now, not on the first event
+        switcher = ProfileSwitcher(mirror, x11, bus, wnck_screen, display.get_default_screen())
+        # The mirror first: the switcher needs to know the default profile.
+        mirror.start(on_profiles_changed=switcher.schedule_soon)
+        switcher.start()
+
+        loop = GLib.MainLoop()
+
+        def quit_loop(signum: int) -> bool:
+            log.info("stopping (%s)", signal.Signals(signum).name)
+            loop.quit()
+            return GLib.SOURCE_REMOVE
+
+        # Ctrl+C or a closed terminal (SIGINT, SIGHUP), or logout (SIGTERM): stop cleanly
+        # and log it, rather than die silently (or, for Ctrl+C, with a traceback).
+        for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum, quit_loop, signum)
+        loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

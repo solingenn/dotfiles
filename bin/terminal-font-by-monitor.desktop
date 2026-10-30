@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal font by monitor
+Exec=/home/mario_nardi/.local/bin/terminal-font-by-monitor
+X-GNOME-Autostart-enabled=true
